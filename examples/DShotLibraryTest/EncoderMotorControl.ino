@@ -15,7 +15,7 @@ const long interval = 1000;
 u8 val = 0;
 u8 pre = 0;
 
-DShot esc;
+DShot esc(DShot::Mode::DSHOT600);
 
 void action()
 {
