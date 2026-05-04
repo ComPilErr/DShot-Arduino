@@ -1,293 +1,232 @@
 #include "Arduino.h"
+#include "HardwareTimer.h"
 #include "DShot.h"
 
-
-// Each item contains the bit of the port
-// Pins that are not attached will always be 1
-// This is to offload the Off pattern calculation during bit send
-static uint8_t dShotBits[16];
-
-// Denote which pin is attached to dShot
-static uint8_t dShotPins = 0;
-
-// Mode: 600/300/150
-static enum DShot::Mode dShotMode = DShot::Mode::DSHOT600;
-
-
-#define NOP	"NOP\n"
-#define NOP2 NOP NOP
-#define NOP4 NOP2 NOP2
-#define NOP8 NOP4 NOP4
-
 /*
-	DSHOT600 implementation
-	For 16MHz CPU,
-	0: 10 cycle ON, 17 cycle OFF
-	1: 20 cycle ON, 7 cycle OFF
-	Total 27 cycle each bit
-*/
-static inline void sendData(){
-	noInterrupts();
-	switch (dShotMode) {
-	case DShot::Mode::DSHOT600:
-	default:
-		asm(
-		// For i = 0 to 15:
-		"LDI	r23,	0\n"
-		// Set High for every attached pins
-		// DSHOT_PORT |= dShotPins;
-		"IN	r25,	%0\n"
-		"_for_loop_0:\n"
-		"OR	r25,	%1\n"
-		// Wait 7 cycles (7 - 6 = 1)
-		"NOP\n"
+ * DShot for STM32F103 BluePill using Timer PWM + DMA.
+ *
+ * Mirrors the iNav / Betaflight approach:
+ *   - A hardware timer runs at 12 MHz (DSHOT600), 6 MHz (DSHOT300),
+ *     or 3 MHz (DSHOT150) with ARR = 19 (period = 20 ticks = 1 bit).
+ *   - The timer's Update event fires a DMA request each bit period.
+ *   - DMA writes a new CCR value from the frame buffer to the timer's
+ *     capture/compare register, setting the duty cycle for that bit:
+ *       bit-0 → CCR = 7  (35 % duty)
+ *       bit-1 → CCR = 14 (70 % duty)
+ *   - The last two buffer entries are 0 (output stays LOW = inter-frame gap).
+ *   - A 500 Hz HardwareTimer ISR restarts the DMA every 2 ms.
+ *
+ * Supported pins / timers / DMA channels (STM32F103):
+ *   PA0  TIM2_CH1  TIM2_UP → DMA1_Channel2
+ *   PA6  TIM3_CH1  TIM3_UP → DMA1_Channel3
+ *   PB6  TIM4_CH1  TIM4_UP → DMA1_Channel7
+ */
 
-		"OUT	%0,	r25\n"
-		// Wait 10 cycles (10 - 4 = 6)
-		NOP4
-		NOP2
-		// Set Low for low bits only
-		//DSHOT_PORT &= dShotBits[i];
-		"LD	r24,	Z+\n"
-		"AND	r25,	r24\n"
-		"OUT	%0,	r25\n"
-		// Wait 10 cycles (10 - 2 = 8)
-		NOP8
-		// Turn off everything
-		// DSHOT_PORT &= ~dShotPins;
-		"AND	r25,	%2\n"
-		"OUT	%0,	r25\n"
-		// Add to i (tmp_reg)
-		"INC	r23\n"
-		"CPI	r23,	16\n"
-		"BRLO	_for_loop_0\n"
-		// 7 cycles to next bit (4 to add to i and branch, 2 to turn on), no wait
-		:
-		: "I" (_SFR_IO_ADDR(DSHOT_PORT)), "r" (dShotPins), "r" (~dShotPins), "z" (dShotBits)
-		: "r25", "r24", "r23"
-		);
-		break;
-	case DShot::Mode::DSHOT300:
-		asm(
-		// For i = 0 to 15:
-		"LDI	r23,	0\n"
-		// Set High for every attached pins
-		// DSHOT_PORT |= dShotPins;
-		"IN	r25,	%0\n"
-		"_for_loop_1:\n"
-		"OR	r25,	%1\n"
-		// Wait 14 cycles (14 - 6 = 8)
+/* ---- iNav DShot constants (timer ticks) ---- */
+#define DSHOT_BIT_0       7
+#define DSHOT_BIT_1       14
+#define DSHOT_BITLENGTH   20   // ticks per bit period
+#define DSHOT_DMA_SIZE    18   // 16 data bits + 2 reset ticks
 
-		// 1 + 3 * N //
-		"LDI	r26,	2\n"		// 1 // set N
-		"_sleep_loop_1_1:\n"
-		"DEC	r26\n"			// 1 //
-		"BRNE	_sleep_loop_1_1\n"	// 2 //
-		"NOP\n"				// 1 // BRNE on skip uses only 1 cycle, not 2
-		// 1 + 3 * N //
-		"NOP\n"
+#define DSHOT_MAX_MOTORS  3
 
-		"OUT	%0,	r25\n"
-		// Wait 20 cycles (20 - 4 = 16)
+/* ---- pin → timer → DMA mapping ---- */
+struct DshotPinMap {
+    uint8_t              arduinoPin;
+    GPIO_TypeDef        *gpio;
+    uint8_t              gpioPin;       // 0–15
+    TIM_TypeDef         *tim;
+    volatile uint32_t   *ccr;           // pointer to TIMx->CCR1
+    DMA_Channel_TypeDef *dma;           // DMA channel for TIMx_UP
+};
 
-		// 1 + 3 * N //
-		"LDI	r26,	5\n"		// 1 // set N
-		"_sleep_loop_1_2:\n"
-		"DEC	r26\n"			// 1 //
-		"BRNE	_sleep_loop_1_2\n"	// 2 //
-		"NOP\n"				// 1 // BRNE on skip uses only 1 cycle, not 2
-		// 1 + 3 * N //
+static const DshotPinMap DSHOT_PIN_MAP[] = {
+    { PA0, GPIOA, 0, TIM2, &TIM2->CCR1, DMA1_Channel2 },  // TIM2_UP → CH2
+    { PA6, GPIOA, 6, TIM3, &TIM3->CCR1, DMA1_Channel3 },  // TIM3_UP → CH3
+    { PB6, GPIOB, 6, TIM4, &TIM4->CCR1, DMA1_Channel7 },  // TIM4_UP → CH7
+};
+#define DSHOT_PIN_MAP_SIZE (sizeof(DSHOT_PIN_MAP) / sizeof(DSHOT_PIN_MAP[0]))
 
-		// Set Low for low bits only
-		//DSHOT_PORT &= dShotBits[i];
-		"LD	r24,	Z+\n"	// 2 //
-		"AND	r25,	r24\n"
-		"OUT	%0,	r25\n"
-		// Wait 20 cycles (20 - 2 = 18)
+/* ---- per-motor state ---- */
+struct MotorState {
+    const DshotPinMap *pin;
+    // pendingBuffer is written by setThrottle() (main thread).
+    // dmaBuffer is copied from pendingBuffer by the frame ISR just before DMA
+    // starts, so DMA always reads a consistent, fully-written frame.
+    uint32_t pendingBuffer[DSHOT_DMA_SIZE];
+    uint32_t dmaBuffer[DSHOT_DMA_SIZE];
+    bool     active;
+};
 
-		// 1 + 3 * N //
-		"LDI	r26,	5\n"		// 1 // set N
-		"_sleep_loop_1_3:\n"
-		"DEC	r26\n"			// 1 //
-		"BRNE	_sleep_loop_1_3\n"	// 2 //
-		"NOP\n"				// 1 // BRNE on skip uses only 1 cycle, not 2
-		// 1 + 3 * N //
+static MotorState      motors[DSHOT_MAX_MOTORS];
+static uint8_t         motorCount  = 0;
+static HardwareTimer  *frameTimer  = nullptr;
+static DShot::Mode     dshotMode   = DShot::Mode::DSHOT600;
 
-		"NOP\n"
-		"NOP\n"
-		// Turn off everything
-		// DSHOT_PORT &= ~dShotPins;
-		"AND	r25,	%2\n"
-		"OUT	%0,	r25\n"
-		// Add to i (tmp_reg)
-		"INC	r23\n"
-		"CPI	r23,	16\n"
-		"BRLO	_for_loop_1\n"
-		// 7 cycles to next bit (4 to add to i and branch, 2 to turn on), no wait
-		:
-		: "I" (_SFR_IO_ADDR(DSHOT_PORT)), "r" (dShotPins), "r" (~dShotPins), "z" (dShotBits)
-		: "r25", "r24", "r23"
-		);
-		break;
-	case DShot::Mode::DSHOT150:
-		asm(
-		// For i = 0 to 15:
-		"LDI	r23,	0\n"
-		// Set High for every attached pins
-		// DSHOT_PORT |= dShotPins;
-		"IN	r25,	%0\n"
+/* ---- helpers ---- */
 
-		"_for_loop_2:\n"
-		"OR	r25,	%1\n"
-		// Wait 28 cucles (28 - 6 = 22)
-
-		// 1 + 3 * N //
-		"LDI	r26,	7\n"		// 1 // set N
-		"_sleep_loop_2_1:\n"
-		"DEC	r26\n"			// 1 //
-		"BRNE	_sleep_loop_2_1\n"	// 2 //
-		"NOP\n"				// 1 // BRNE on skip uses only 1 cycle, not 2
-		// 1 + 3 * N //
-
-		"OUT	%0,	r25\n"
-		// Wait 40 cycles (40 - 4 = 36)
-
-		// 1 + 3 * N //
-		"LDI	r26,	11\n"		// 1 // set N
-		"_sleep_loop_2_2:\n"
-		"DEC	r26\n"			// 1 //
-		"BRNE	_sleep_loop_2_2\n"	// 2 //
-		"NOP\n"				// 1 // BRNE on skip uses only 1 cycle, not 2
-		// 1 + 3 * N //
-
-		"NOP\n"
-		"NOP\n"
-
-		// Set Low for low bits only
-		//DSHOT_PORT &= dShotBits[i];
-		"LD	r24,	Z+\n"
-		"AND	r25,	r24\n"
-		"OUT	%0,	r25\n"
-		// Wait 40 cycles (40 - 2 = 38)
-
-		// 1 + 3 * N //
-		"LDI	r26,	11\n"		// 1 // set N
-		"_sleep_loop_2_3:\n"
-		"DEC	r26\n"			// 1 //
-		"BRNE	_sleep_loop_2_3\n"	// 2 //
-		"NOP\n"				// 1 // BRNE on skip uses only 1 cycle, not 2
-		// 1 + 3 * N //
-
-		"NOP\n"
-		"NOP\n"
-		"NOP\n"
-		"NOP\n"
-
-		// Turn off everything
-		// DSHOT_PORT &= ~dShotPins;
-		"AND	r25,	%2\n"
-		"OUT	%0,	r25\n"
-		// Add to i (tmp_reg)
-		"INC	r23\n"
-		"CPI	r23,	16\n"
-		"BRLO	_for_loop_2\n"
-		// 7 cycles to next bit (4 to add to i and branch, 2 to turn on), no wait
-		:
-		: "I" (_SFR_IO_ADDR(DSHOT_PORT)), "r" (dShotPins), "r" (~dShotPins), "z" (dShotBits)
-		: "r25", "r24", "r23", "r26"
-		);
-		break;
-	}
-	interrupts();
+// Configure a GPIO pin as alternate-function push-pull output at 50 MHz.
+// STM32F103 uses CRL (pins 0-7) / CRH (pins 8-15): MODE=11, CNF=10 → 0xB.
+static void gpioConfigAF(GPIO_TypeDef *gpio, uint8_t pin) {
+    if (gpio == GPIOA) RCC->APB2ENR |= RCC_APB2ENR_IOPAEN;
+    else if (gpio == GPIOB) RCC->APB2ENR |= RCC_APB2ENR_IOPBEN;
+    else if (gpio == GPIOC) RCC->APB2ENR |= RCC_APB2ENR_IOPCEN;
+    __IO uint32_t *cr = (pin < 8) ? &gpio->CRL : &gpio->CRH;
+    uint8_t shift = (pin % 8) * 4;
+    *cr = (*cr & ~(0xFUL << shift)) | (0xBUL << shift);
 }
 
-static boolean timerActive = false;
-/*
-  Generated by:
-  http://www.8bit-era.cz/arduino-timer-interrupts-calculator.html
-  1000 Hz Update rate
-*/
-static void initISR(){
-cli(); // stop interrupts
-TCCR1A = 0; // set entire TCCR1A register to 0
-TCCR1B = 0; // same for TCCR1B
-TCNT1  = 0; // initialize counter value to 0
-// set compare match register for 500 Hz increments
-OCR1A = 31999; // = 16000000 / (1 * 500) - 1 (must be <65536)
-// turn on CTC mode
-TCCR1B |= (1 << WGM12);
-// Set CS12, CS11 and CS10 bits for 1 prescaler
-TCCR1B |= (0 << CS12) | (0 << CS11) | (1 << CS10);
-// enable timer compare interrupt
-TIMSK1 |= (1 << OCIE1A);
-	timerActive = true;
-	for (byte i=0; i<16; i++){
-		dShotBits[i] = 0;
-	}
-	dShotPins = 0;
-
-	sei(); // allow interrupts
+static void enableTimerClock(TIM_TypeDef *tim) {
+    if      (tim == TIM2) RCC->APB1ENR |= RCC_APB1ENR_TIM2EN;
+    else if (tim == TIM3) RCC->APB1ENR |= RCC_APB1ENR_TIM3EN;
+    else if (tim == TIM4) RCC->APB1ENR |= RCC_APB1ENR_TIM4EN;
 }
 
-static boolean isTimerActive(){
-  return timerActive;
+// Copy pendingBuffer → dmaBuffer, then (re)start the DMA channel.
+// Called from the frame ISR with DMA disabled, so the copy is safe.
+static void startMotorDMA(MotorState *m) {
+    DMA_Channel_TypeDef *dma = m->pin->dma;
+    dma->CCR &= ~DMA_CCR_EN;                        // must disable before writing CNDTR
+    memcpy(m->dmaBuffer, m->pendingBuffer, DSHOT_DMA_SIZE * sizeof(uint32_t));
+    dma->CMAR = (uint32_t)m->dmaBuffer;
+    dma->CNDTR = DSHOT_DMA_SIZE;
+    dma->CCR  |= DMA_CCR_EN;                        // re-enable; first transfer on next Update
 }
 
-ISR(TIMER1_COMPA_vect){
-   sendData();
+// 500 Hz ISR: send one DShot frame on every active motor.
+static void frameISR() {
+    for (int i = 0; i < motorCount; i++) {
+        if (motors[i].active)
+            startMotorDMA(&motors[i]);
+    }
+}
+
+static void initFrameTimer() {
+    frameTimer = new HardwareTimer(TIM1);
+    frameTimer->setOverflow(500, HERTZ_FORMAT);
+    frameTimer->attachInterrupt(frameISR);
+    frameTimer->resume();
+}
+
+/* ---- packet helper (identical logic to original AVR library) ---- */
+static uint16_t createPacket(uint16_t throttle) {
+    uint8_t csum = 0;
+    throttle <<= 1;
+    if (throttle < 48 && throttle > 0)
+        throttle |= 1;
+    uint16_t csum_data = throttle;
+    for (int i = 0; i < 3; i++) {
+        csum ^= csum_data;
+        csum_data >>= 4;
+    }
+    csum &= 0xf;
+    return (throttle << 4) | csum;
+}
+
+/****************** DShot class ******************/
+
+DShot::DShot(const enum Mode mode) {
+    dshotMode = mode;
 }
 
 /*
-  Prepare data packet, attach 0 to telemetry bit, and calculate CRC
-  throttle: 11-bit data
-*/
-static inline uint16_t createPacket(uint16_t throttle){
-  uint8_t csum = 0;
-  throttle <<= 1;
-	// Indicate as command if less than 48
-	if (throttle < 48 && throttle > 0)
-		throttle |= 1;
-  uint16_t csum_data = throttle;
-  for (byte i=0; i<3; i++){
-    csum ^= csum_data;
-    csum_data >>= 4;
-  }
-  csum &= 0xf;
-  return (throttle<<4)|csum;
-}
+ * attach() — configure a pin for DShot output.
+ *
+ * Sets up:
+ *   1. GPIO in AF push-pull mode
+ *   2. Timer for PWM CH1 output (12/6/3 MHz clock, period = 20 ticks)
+ *      with Update DMA request enabled
+ *   3. DMA channel: memory → CCR1, 32-bit transfers, one-shot
+ *   4. 500 Hz frame timer (TIM1) if not already running
+ */
+void DShot::attach(uint8_t pin) {
+    const DshotPinMap *p = nullptr;
+    for (size_t i = 0; i < DSHOT_PIN_MAP_SIZE; i++) {
+        if (DSHOT_PIN_MAP[i].arduinoPin == pin) {
+            p = &DSHOT_PIN_MAP[i];
+            break;
+        }
+    }
+    if (!p || motorCount >= DSHOT_MAX_MOTORS) return;
 
-/****************** end of static functions *******************/
+    _motorIdx = motorCount++;
+    MotorState *m = &motors[_motorIdx];
+    m->pin    = p;
+    m->active = true;
+    memset(m->pendingBuffer, 0, sizeof(m->pendingBuffer));
+    memset(m->dmaBuffer,     0, sizeof(m->dmaBuffer));
 
-DShot::DShot(const enum Mode mode){
-    dShotMode = mode;
-}
+    /* 1. GPIO */
+    gpioConfigAF(p->gpio, p->gpioPin);
 
-void DShot::attach(uint8_t pin){
-  this->_packet = 0;
-  this->_pinMask = digitalPinToBitMask(pin);
-  pinMode(pin, OUTPUT);
-  if (!isTimerActive()){
-    initISR();
-  }
-  dShotPins |= this->_pinMask;
+    /* 2. Timer */
+    enableTimerClock(p->tim);
+
+    // Prescaler: divide SystemCoreClock down to the DShot base frequency.
+    // DSHOT600 → 12 MHz, DSHOT300 → 6 MHz, DSHOT150 → 3 MHz.
+    uint32_t baseHz;
+    switch (dshotMode) {
+        case DShot::Mode::DSHOT600: baseHz = 12000000UL; break;
+        case DShot::Mode::DSHOT300: baseHz =  6000000UL; break;
+        default:                    baseHz =  3000000UL; break;
+    }
+    uint32_t psc = (SystemCoreClock / baseHz) - 1;
+
+    TIM_TypeDef *tim = p->tim;
+    tim->CR1   = 0;
+    tim->PSC   = psc;
+    tim->ARR   = DSHOT_BITLENGTH - 1;       // 19 → period = 20 ticks
+    tim->CCR1  = 0;
+    // PWM mode 1 on CH1, preload DISABLED (DMA write takes effect immediately)
+    tim->CCMR1 = (6 << TIM_CCMR1_OC1M_Pos);
+    tim->CCER  = TIM_CCER_CC1E;             // CH1 output, active high
+    tim->DIER  = TIM_DIER_UDE;              // Update event → DMA request
+    tim->EGR   = TIM_EGR_UG;               // load PSC/ARR now
+    tim->SR    = 0;                         // clear the update flag set by UG
+    tim->CR1   = TIM_CR1_CEN;              // start
+
+    /* 3. DMA */
+    RCC->AHBENR |= RCC_AHBENR_DMA1EN;
+
+    DMA_Channel_TypeDef *dma = p->dma;
+    dma->CCR = 0;                           // disable while configuring
+    dma->CPAR  = (uint32_t)p->ccr;         // peripheral: TIMx->CCR1
+    dma->CMAR  = (uint32_t)m->dmaBuffer;   // memory: frame buffer
+    dma->CNDTR = DSHOT_DMA_SIZE;
+    dma->CCR   = DMA_CCR_MSIZE_0   |       // 32-bit memory transfers
+                 DMA_CCR_PSIZE_0   |       // 32-bit peripheral transfers
+                 DMA_CCR_MINC      |       // increment memory address
+                 DMA_CCR_DIR;              // memory → peripheral (one-shot, no circ)
+    // DMA enable deferred to first frameISR call.
+
+    /* 4. Frame timer */
+    if (!frameTimer)
+        initFrameTimer();
 }
 
 /*
-  Set the throttle value and prepare the data packet and store
-  throttle: 11-bit data
-*/
-uint16_t DShot::setThrottle(uint16_t throttle){
-  this->_throttle = throttle;
+ * setThrottle() — update the DShot frame for this motor.
+ *
+ * Writes to pendingBuffer under noInterrupts() so the frame ISR always
+ * copies a complete, consistent frame into the DMA buffer.
+ *
+ * throttle: 0 = disarm, 48–2047 = throttle range.
+ */
+uint16_t DShot::setThrottle(uint16_t throttle) {
+    _throttle = throttle;
+    _packet   = createPacket(throttle);
 
-  // TODO: This part can be further optimized when combine with create packet
-  this->_packet = createPacket(throttle);
-  uint16_t mask = 0x8000;
-  for (byte i=0; i<16; i++){
-    if (this->_packet & mask)
-      dShotBits[i] |= this->_pinMask;
-    else
-      dShotBits[i] &= ~(this->_pinMask);
-    mask >>= 1;
-  }
-  return _packet;
+    MotorState *m = &motors[_motorIdx];
+    uint16_t mask = 0x8000;
+
+    noInterrupts();
+    for (int i = 0; i < 16; i++) {
+        m->pendingBuffer[i] = (_packet & mask) ? DSHOT_BIT_1 : DSHOT_BIT_0;
+        mask >>= 1;
+    }
+    m->pendingBuffer[16] = 0;   // inter-frame gap (output LOW)
+    m->pendingBuffer[17] = 0;
+    interrupts();
+
+    return _packet;
 }
