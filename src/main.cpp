@@ -1,5 +1,5 @@
 #include <Arduino.h>
-#include <DShot.h>
+#include <Servo.h>
 
 /*
 
@@ -12,40 +12,23 @@ Leonardo: PORTB, available pins 4-7 (D8-D11)
 e.g.
 #define DSHOT_PORT PORTD
 */
-DShot esc1(DShot::Mode::DSHOT300);
-
-uint16_t throttle = 0;
-uint16_t target = 0;
+Servo myESC;
+volatile uint16_t target;
 
 void setup() {
-  Serial.begin(115200);
-
   // Notice, all pins must be connected to same PORT
-  esc1.attach(7);  
-  esc1.setThrottle(throttle);
+  target = 0;
+  Serial.begin(115200);
+  myESC.attach(PD7); 
+  myESC.writeMicroseconds(1000);
 }
 
 void loop() {
   if (Serial.available()>0){
     target = Serial.parseInt();
-    if (target>2047)
-      target = 2047;
-    Serial.print(target, HEX);
-    Serial.print("\t");
-  }
-  if (throttle<48){
-    throttle = 48;
-  }
-  if (target<=48){
-    esc1.setThrottle(target);
-  }else{
-    if (target>throttle){
-      throttle ++;
-      esc1.setThrottle(throttle);
-    }else if (target<throttle){
-      throttle --;
-      esc1.setThrottle(throttle);
-    }
+    if (target>2020) target = 2020;
+    Serial.print(target, DEC); Serial.print("\n");
+    myESC.writeMicroseconds(target);
   }
   delay(10);
 }
