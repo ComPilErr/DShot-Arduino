@@ -1,2 +1,2 @@
 #!/bin/bash
-picocom -b 115200 /dev/ttyUSB0
+picocom -b 115200 --flow n --omap crcrlf --imap lfcrlf  --echo /dev/ttyUSB0
