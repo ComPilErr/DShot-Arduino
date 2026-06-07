@@ -3,6 +3,8 @@
 #ifndef DShot_h
 #define DShot_h
 
+#define DSHOT_PORT PORTD
+
 #if defined(__AVR_ATmega328P__)
 // For UNO, PortD 0-7: i.e. D0-D7
 #define DSHOT_PORT PORTD
